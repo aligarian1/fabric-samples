@@ -5,6 +5,7 @@ a builder: no "delayed", "fraud" or "safe", only dates and figures as filed.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
@@ -62,6 +63,7 @@ _T: Dict[str, Dict[str, str]] = {
         "b.no_reports": "No quarterly report is on record for this project.",
         "b.removed_from_list": "This project no longer appears in the HRERA registered-projects list.",
         "f.page": "Official page: {url}",
+        "f.unsubscribe": "Stop these alerts or delete your data: {url}",
         "f.source": "Source: public records on the Haryana RERA website (haryanarera.gov.in). Figures are as filed by the builder. This is information, not legal advice.",
         "s.project_id": "Project ID",
         "s.builder": "Builder",
@@ -121,6 +123,7 @@ _T: Dict[str, Dict[str, str]] = {
         "b.no_reports": "इस प्रोजेक्ट की कोई तिमाही रिपोर्ट दर्ज नहीं है।",
         "b.removed_from_list": "यह प्रोजेक्ट अब HRERA की रजिस्टर्ड प्रोजेक्ट सूची में नहीं दिख रहा है।",
         "f.page": "आधिकारिक पेज: {url}",
+        "f.unsubscribe": "ये अलर्ट बंद करें या अपना डेटा मिटाएँ: {url}",
         "f.source": "स्रोत: हरियाणा RERA की वेबसाइट (haryanarera.gov.in) की सार्वजनिक जानकारी। आंकड़े बिल्डर द्वारा दाखिल किए गए हैं। यह केवल जानकारी है, कानूनी सलाह नहीं।",
         "s.project_id": "प्रोजेक्ट आईडी",
         "s.builder": "बिल्डर",
@@ -198,9 +201,13 @@ def _report_lines(report: Optional[dict], previous: Optional[dict], lang: str) -
     return lines
 
 
-def _footer(state: dict, lang: str) -> List[str]:
+def _footer(state: dict, lang: str, unsubscribe_url: Optional[str] = None) -> List[str]:
     url = state.get("detail_url") or state.get("list_url") or LIST_URL
-    return ["", tr(lang, "f.page", url=url), tr(lang, "f.source")]
+    lines = ["", tr(lang, "f.page", url=url)]
+    if unsubscribe_url:
+        lines.append(tr(lang, "f.unsubscribe", url=unsubscribe_url))
+    lines.append(tr(lang, "f.source"))
+    return lines
 
 
 def _title(state: dict) -> str:
@@ -221,71 +228,127 @@ def _overdue_lines(data: dict, today: date, lang: str) -> List[str]:
     return lines
 
 
-def render_status(state: dict, today: date, lang: str = "en", overdue_grace_days: int = 30) -> str:
-    """A full plain-language status report for one project."""
-    lines = [_title(state), ""]
-    lines.append("%s: %s" % (tr(lang, "s.project_id"), state.get("project_id", "")))
+@dataclass
+class Facts:
+    """What a status page or message says about one project, as plain strings."""
+
+    title: str
+    rows: List[Tuple[str, str]]
+    reports: Optional[str]  # None when the quarterly list was never read
+    latest: Optional[str]
+    report_lines: List[str]
+    warnings: List[str]
+    hearings_label: str
+    hearings: List[Tuple[str, str, str]]
+    page_url: str
+    page_line: str
+    source_line: str
+
+
+def facts(state: dict, today: date, lang: str = "en", overdue_grace_days: int = 30) -> Facts:
+    """Collect everything we can say about a project in ``lang``."""
+    rows: List[Tuple[str, str]] = [(tr(lang, "s.project_id"), state.get("project_id", ""))]
     if state.get("builder"):
-        lines.append("%s: %s" % (tr(lang, "s.builder"), state["builder"]))
+        rows.append((tr(lang, "s.builder"), state["builder"]))
     place = ", ".join(p for p in (state.get("location"), state.get("district")) if p)
     if place:
-        lines.append("%s: %s" % (tr(lang, "s.location"), place))
+        rows.append((tr(lang, "s.location"), place))
     if state.get("reg_no"):
-        lines.append("%s: %s" % (tr(lang, "s.reg_no"), state["reg_no"]))
+        rows.append((tr(lang, "s.reg_no"), state["reg_no"]))
 
     valid = state.get("valid_upto")
     valid_text = fmt_date(valid, lang)
     if valid:
         days = (date.fromisoformat(valid) - today).days
         valid_text += " (%s)" % (tr(lang, "s.days_left", days=days) if days >= 0 else tr(lang, "s.days_ago", days=-days))
-    lines.append("%s: %s" % (tr(lang, "s.valid"), valid_text))
-    lines.append("%s: %s" % (tr(lang, "s.lapsed"), tr(lang, "s.yes" if state.get("lapsed") else "s.no")))
-    lines.append("%s: %s" % (tr(lang, "s.occ"), tr(lang, "s.yes" if state.get("occ") else "s.no")))
+    rows.append((tr(lang, "s.valid"), valid_text))
+    rows.append((tr(lang, "s.lapsed"), tr(lang, "s.yes" if state.get("lapsed") else "s.no")))
+    rows.append((tr(lang, "s.occ"), tr(lang, "s.yes" if state.get("occ") else "s.no")))
     if state.get("status"):
-        lines.append("%s: %s" % (tr(lang, "s.status"), state["status"]))
+        rows.append((tr(lang, "s.status"), state["status"]))
     if state.get("next_hearing"):
-        lines.append("%s: %s" % (tr(lang, "s.next_hearing"), state["next_hearing"]))
+        rows.append((tr(lang, "s.next_hearing"), state["next_hearing"]))
 
+    reports = latest_line = None
+    report_lines: List[str] = []
+    warnings: List[str] = []
     if "quarters" in state:
         quarters = state.get("quarters") or []
-        lines.append("")
-        lines.append("%s: %d" % (tr(lang, "s.reports"), len(quarters)))
+        reports = "%s: %d" % (tr(lang, "s.reports"), len(quarters))
         latest = latest_quarter(state)
         report = state.get("latest_report")
         if latest:
             label = quarter_label(latest["no"], latest["year"], lang)
             if report and report.get("submitted_on"):
-                lines.append(tr(lang, "s.latest_report", quarter=label, date=fmt_date(report["submitted_on"], lang)))
+                latest_line = tr(lang, "s.latest_report", quarter=label, date=fmt_date(report["submitted_on"], lang))
             else:
-                lines.append(tr(lang, "s.latest_report_nodate", quarter=label))
-            lines.extend("  " + line for line in _report_lines(report, None, lang))
+                latest_line = tr(lang, "s.latest_report_nodate", quarter=label)
+            report_lines = _report_lines(report, None, lang)
         if not state.get("occ"):
             number, year = last_ended_quarter(today)
             end = quarter_end(number, year)
             if (today - end).days > overdue_grace_days and latest and (latest["year"], latest["no"]) < (year, number):
                 data = {"quarter_end": end.isoformat(), "latest": None}
-                lines.append("! " + _overdue_lines(data, today, lang)[0])
+                warnings.append(_overdue_lines(data, today, lang)[0])
 
-    hearings = sorted(state.get("hearings") or [], key=lambda h: h.get("date") or "", reverse=True)[:3]
-    if hearings:
+    hearings: List[Tuple[str, str, str]] = []
+    for hearing in sorted(state.get("hearings") or [], key=lambda h: h.get("date") or "", reverse=True)[:3]:
+        text = hearing.get("text") or ""
+        if len(text) > 220:
+            text = text[:220].rstrip() + "…"
+        hearings.append((fmt_date(hearing.get("date"), lang), hearing.get("status") or "", text))
+
+    page_url = state.get("detail_url") or state.get("list_url") or LIST_URL
+    return Facts(
+        title=_title(state),
+        rows=rows,
+        reports=reports,
+        latest=latest_line,
+        report_lines=report_lines,
+        warnings=warnings,
+        hearings_label=tr(lang, "s.hearings"),
+        hearings=hearings,
+        page_url=page_url,
+        page_line=tr(lang, "f.page", url=page_url),
+        source_line=tr(lang, "f.source"),
+    )
+
+
+def render_status(
+    state: dict,
+    today: date,
+    lang: str = "en",
+    overdue_grace_days: int = 30,
+    unsubscribe_url: Optional[str] = None,
+) -> str:
+    """A full plain-language status report for one project."""
+    f = facts(state, today, lang, overdue_grace_days)
+    lines = [f.title, ""]
+    lines.extend("%s: %s" % row for row in f.rows)
+    if f.reports is not None:
         lines.append("")
-        lines.append("%s:" % tr(lang, "s.hearings"))
-        for hearing in hearings:
-            text = hearing.get("text") or ""
-            if len(text) > 220:
-                text = text[:220].rstrip() + "…"
-            lines.append("  %s — %s: %s" % (fmt_date(hearing.get("date"), lang), hearing.get("status") or "", text))
-    lines.extend(_footer(state, lang))
+        lines.append(f.reports)
+        if f.latest:
+            lines.append(f.latest)
+        lines.extend("  " + line for line in f.report_lines)
+        lines.extend("! " + warning for warning in f.warnings)
+    if f.hearings:
+        lines.append("")
+        lines.append("%s:" % f.hearings_label)
+        lines.extend("  %s — %s: %s" % hearing for hearing in f.hearings)
+    lines.extend(_footer(state, lang, unsubscribe_url))
     return "\n".join(lines)
 
 
-def render(event: Event, state: dict, today: date, lang: str = "en") -> Tuple[str, str]:
+def render(
+    event: Event, state: dict, today: date, lang: str = "en", unsubscribe_url: Optional[str] = None
+) -> Tuple[str, str]:
     """(subject, body) for one event."""
     lang = _lang(lang)
     kind, data = event.kind, event.data
     subject = "%s — %s" % (tr(lang, "t." + kind), _title(state))
     if kind == "baseline":
-        return subject, render_status(state, today, lang)
+        return subject, render_status(state, today, lang, unsubscribe_url=unsubscribe_url)
 
     lines: List[str] = []
     if kind in ("marked_lapsed", "occ_uploaded", "corrigendum_added", "monitoring_started", "removed_from_list"):
@@ -320,5 +383,5 @@ def render(event: Event, state: dict, today: date, lang: str = "en") -> Tuple[st
 
     body = [_title(state), "%s: %s" % (tr(lang, "s.project_id"), state.get("project_id", "")), ""]
     body.extend(lines)
-    body.extend(_footer(state, lang))
+    body.extend(_footer(state, lang, unsubscribe_url))
     return subject, "\n".join(body)

@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS outbox (
     UNIQUE (subscriber_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS signups (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    lang TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    notice_version TEXT NOT NULL,
+    consent_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    subscriber_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS signups_email ON signups(email, created_at);
 """
 
 
@@ -73,11 +85,15 @@ def _dump(value: object) -> str:
 
 
 class Store:
-    def __init__(self, path: str = "rera_tracker.db") -> None:
-        self.db = sqlite3.connect(path)
+    def __init__(self, path: str = "rera_tracker.db", init: bool = True) -> None:
+        # A web server and the daily job may use the file at the same time.
+        self.db = sqlite3.connect(path, timeout=30)
         self.db.row_factory = sqlite3.Row
-        self.db.executescript(_SCHEMA)
-        self.db.commit()
+        if init:
+            if path != ":memory:":
+                self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.executescript(_SCHEMA)
+            self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -143,11 +159,13 @@ class Store:
         return [self._project(r) for r in rows]
 
     def find_projects(self, text: str, limit: int = 20) -> List[dict]:
-        like = "%" + text.strip() + "%"
+        # "%" and "_" typed by a visitor are ordinary characters, not wildcards.
+        escaped = text.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = "%" + escaped + "%"
         rows = self.db.execute(
-            "SELECT * FROM projects WHERE name LIKE ? OR builder LIKE ? OR project_id LIKE ? OR location LIKE ?"
-            " ORDER BY name LIMIT ?",
-            (like, like, like, like, limit),
+            "SELECT * FROM projects WHERE name LIKE ?1 ESCAPE '\\' OR builder LIKE ?1 ESCAPE '\\'"
+            " OR project_id LIKE ?1 ESCAPE '\\' OR location LIKE ?1 ESCAPE '\\' ORDER BY name LIMIT ?2",
+            (like, limit),
         ).fetchall()
         return [self._project(r) for r in rows]
 
@@ -250,7 +268,7 @@ class Store:
 
     def pending_messages(self) -> List[dict]:
         rows = self.db.execute(
-            "SELECT o.id, o.subject, o.body, o.created_at, u.channel, u.address, u.name, u.lang"
+            "SELECT o.id, o.subject, o.body, o.created_at, o.subscriber_id, u.channel, u.address, u.name, u.lang"
             " FROM outbox o JOIN subscribers u ON u.id = o.subscriber_id"
             " WHERE o.sent_at IS NULL AND u.active = 1 ORDER BY o.id"
         ).fetchall()
@@ -259,3 +277,99 @@ class Store:
     def mark_sent(self, message_id: int, sent_at: Optional[str], error: Optional[str] = None) -> None:
         self.db.execute("UPDATE outbox SET sent_at = ?, error = ? WHERE id = ?", (sent_at, error, message_id))
         self.db.commit()
+
+    # -- public sign-ups (double opt-in) --------------------------------------
+    def create_signup(self, email: str, lang: str, project_key: str, notice_version: str, consent_at: str) -> int:
+        """Record a sign-up request and the consent that came with it.  Not active until confirmed."""
+        cursor = self.db.execute(
+            "INSERT INTO signups(email, lang, project_key, notice_version, consent_at, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (email, lang, project_key, notice_version, consent_at, consent_at),
+        )
+        self.db.commit()
+        return int(cursor.lastrowid)
+
+    def get_signup(self, signup_id: int) -> Optional[dict]:
+        row = self.db.execute("SELECT * FROM signups WHERE id = ?", (signup_id,)).fetchone()
+        return dict(row) if row else None
+
+    def delete_signup(self, signup_id: int) -> None:
+        self.db.execute("DELETE FROM signups WHERE id = ?", (signup_id,))
+        self.db.commit()
+
+    def count_signups_since(self, email: str, since: str, unconfirmed_only: bool = False) -> int:
+        sql = "SELECT COUNT(*) AS n FROM signups WHERE email = ? COLLATE NOCASE AND created_at >= ?"
+        if unconfirmed_only:
+            sql += " AND confirmed_at IS NULL"
+        return int(self.db.execute(sql, (email, since)).fetchone()["n"])
+
+    def confirm_signup(self, signup_id: int, subscriber_id: int, confirmed_at: str) -> None:
+        self.db.execute(
+            "UPDATE signups SET confirmed_at = ?, subscriber_id = ? WHERE id = ?", (confirmed_at, subscriber_id, signup_id)
+        )
+        self.db.commit()
+
+    def purge_unconfirmed(self, created_before: str) -> int:
+        """Delete sign-up requests that were never confirmed.  Returns how many."""
+        cursor = self.db.execute("DELETE FROM signups WHERE confirmed_at IS NULL AND created_at < ?", (created_before,))
+        self.db.commit()
+        return cursor.rowcount
+
+    # -- looking people up, stopping alerts, erasing data ---------------------
+    def get_subscriber_by_id(self, subscriber_id: int) -> Optional[dict]:
+        row = self.db.execute("SELECT * FROM subscribers WHERE id = ?", (subscriber_id,)).fetchone()
+        return dict(row) if row else None
+
+    def is_subscribed(self, channel: str, address: str, project_key: str) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM subscribers u JOIN subscriptions s ON s.subscriber_id = u.id"
+            " WHERE u.channel = ? AND u.address = ? COLLATE NOCASE AND s.project_key = ? AND u.active = 1",
+            (channel, address, project_key),
+        ).fetchone()
+        return row is not None
+
+    def subscriptions_of(self, subscriber_id: int) -> List[str]:
+        rows = self.db.execute(
+            "SELECT project_key FROM subscriptions WHERE subscriber_id = ? ORDER BY project_key", (subscriber_id,)
+        ).fetchall()
+        return [r["project_key"] for r in rows]
+
+    def stop_project(self, subscriber_id: int, project_key: str) -> bool:
+        """Stop one project's alerts.  Erases the person if nothing else is followed.
+
+        Returns True if the person's record was erased as a result.
+        """
+        self.db.execute("DELETE FROM subscriptions WHERE subscriber_id = ? AND project_key = ?", (subscriber_id, project_key))
+        self.db.commit()
+        if not self.subscriptions_of(subscriber_id):
+            self.delete_subscriber(subscriber_id)
+            return True
+        return False
+
+    def delete_subscriber(self, subscriber_id: int) -> bool:
+        """Erase a person: record, follows, queued messages and sign-up requests."""
+        row = self.db.execute("SELECT address FROM subscribers WHERE id = ?", (subscriber_id,)).fetchone()
+        if row is None:
+            return False
+        self.db.execute("DELETE FROM outbox WHERE subscriber_id = ?", (subscriber_id,))
+        self.db.execute("DELETE FROM subscriptions WHERE subscriber_id = ?", (subscriber_id,))
+        self.db.execute("DELETE FROM signups WHERE email = ? COLLATE NOCASE", (row["address"],))
+        self.db.execute("DELETE FROM subscribers WHERE id = ?", (subscriber_id,))
+        self.db.commit()
+        return True
+
+    # -- numbers for the website ----------------------------------------------
+    def count_projects(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) AS n FROM projects WHERE in_list = 1").fetchone()["n"])
+
+    def project_refs(self) -> List[tuple]:
+        """(authority, project_id) of every listed project, for the sitemap."""
+        rows = self.db.execute(
+            "SELECT authority, project_id FROM projects WHERE in_list = 1 ORDER BY authority, project_id"
+        ).fetchall()
+        return [(r["authority"], r["project_id"]) for r in rows]
+
+    def last_sync(self) -> Optional[str]:
+        """The most recent time any authority's list was downloaded."""
+        values = [self.get_meta("synced:%s" % a) for a in ("gurugram", "panchkula")]
+        values = [v for v in values if v]
+        return max(values) if values else None

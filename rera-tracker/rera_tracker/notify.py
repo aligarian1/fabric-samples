@@ -12,7 +12,7 @@ import re
 import smtplib
 import ssl
 from email.message import EmailMessage
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 CHANNELS = ("console", "file", "email", "whatsapp")
 
@@ -25,7 +25,8 @@ def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")[:60] or "message"
 
 
-def _send_email(address: str, subject: str, body: str) -> None:
+def send_email(address: str, subject: str, body: str, headers: Optional[Dict[str, str]] = None) -> None:
+    """Send one plain-text email through the SMTP server named in the environment."""
     host = os.environ.get("RERA_TRACKER_SMTP_HOST")
     sender = os.environ.get("RERA_TRACKER_SMTP_FROM")
     if not host or not sender:
@@ -34,6 +35,10 @@ def _send_email(address: str, subject: str, body: str) -> None:
     message["From"] = sender
     message["To"] = address
     message["Subject"] = subject
+    for name, value in (headers or {}).items():
+        if any(ch in name + value for ch in "\r\n"):
+            raise DeliveryError("refusing a header that contains a line break: %r" % name)
+        message[name] = value
     message.set_content(body)
     port = int(os.environ.get("RERA_TRACKER_SMTP_PORT", "587"))
     user = os.environ.get("RERA_TRACKER_SMTP_USER")
@@ -56,6 +61,7 @@ def deliver(
     message_id: int = 0,
     outbox_dir: str = "outbox",
     out: Optional[Callable[[str], None]] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> None:
     """Deliver one message or raise :class:`DeliveryError`."""
     if channel == "console":
@@ -73,7 +79,7 @@ def deliver(
             handle.write("To: %s\nSubject: %s\n\n%s\n" % (address, subject, body))
         return
     if channel == "email":
-        _send_email(address, subject, body)
+        send_email(address, subject, body, headers)
         return
     if channel == "whatsapp":
         raise DeliveryError("WhatsApp delivery is not set up yet (needs a Meta Business account); see README")

@@ -4,15 +4,18 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
+from . import web
 from .fetch import DEFAULT_DELAY, FetchError, PoliteFetcher
 from .haryana import AUTHORITIES, HaryanaSource, ParseError
 from .messages import LANGS, fmt_date
-from .notify import CHANNELS
+from .notify import CHANNELS, DeliveryError, send_email
 from .store import Store
 from .tracker import Tracker
+
+CONFIRM_DAYS = 7
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -55,8 +58,14 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--lang", choices=LANGS, default="en")
     report.add_argument("--refresh", action="store_true", help="read the site again first")
 
-    run = sub.add_parser("run", help="daily job: sync lists, check tracked projects, send messages")
+    run = sub.add_parser("run", help="daily job: sync both lists, check tracked projects, send messages")
     run.add_argument("--outbox", default="outbox")
+
+    serve = sub.add_parser("serve", help="run the website (development server; see README for real hosting)")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--dev", action="store_true",
+                       help="fill in harmless settings and print confirmation emails instead of sending them")
     return parser
 
 
@@ -76,12 +85,66 @@ def _print_check(result: dict) -> None:
         print("  could not read %s" % problem)
 
 
+def _daily_run(store: Store, tracker: Tracker, outbox: str) -> int:
+    """Sync both lists, check every followed project, send, tidy up, and record how it went."""
+    problems: List[str] = []
+    for authority in sorted(AUTHORITIES):
+        try:
+            counts = tracker.sync(authority)
+            print("%s: %d projects (%d new)" % (authority, counts["total"], counts["new"]))
+        except (FetchError, ParseError) as error:
+            problems.append("%s list: %s" % (authority, error))
+            print("%s: could not sync (%s)" % (authority, error))
+    checked = 0
+    for key in store.tracked_keys():
+        result = tracker.check(key)
+        _print_check(result)
+        checked += 1
+        problems.extend("%s %s" % (key, problem) for problem in result["problems"])
+    counts = tracker.send(outbox)
+    print("%d sent, %d failed" % (counts["sent"], counts["failed"]))
+    if counts["failed"]:
+        problems.append("%d message(s) could not be delivered" % counts["failed"])
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=CONFIRM_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    purged = store.purge_unconfirmed(cutoff)
+    if purged:
+        print("%d unconfirmed sign-up request(s) deleted" % purged)
+
+    store.set_meta("last_run_at", tracker.now())
+    store.set_meta("last_run_problems", str(len(problems)))
+    store.set_meta("last_run_checked", str(checked))
+    admin = os.environ.get("RERA_TRACKER_ADMIN_EMAIL", "").strip()
+    if problems and admin:
+        digest = "The daily RERA tracker run had %d problem(s):\n\n%s\n" % (len(problems), "\n".join("- " + p for p in problems[:30]))
+        try:
+            send_email(admin, "RERA tracker: %d problem(s) in today's run" % len(problems), digest)
+        except DeliveryError as error:
+            print("could not email the problem report: %s" % error, file=sys.stderr)
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     today = date.fromisoformat(args.today) if args.today else None
+    if args.command == "serve":
+        config = web.WebConfig.from_env()
+        config.db_path = args.db
+        if args.dev:
+            config = web.dev_config(config, args.port)
+        try:
+            web.serve(config, args.host, args.port, print_mail=args.dev)
+        except web.ConfigError as error:
+            print("The website is not configured: %s" % error, file=sys.stderr)
+            return 2
+        return 0
+
     store = Store(args.db)
     fetcher = PoliteFetcher(min_delay=args.delay, max_requests=args.max_requests)
-    tracker = Tracker(store, HaryanaSource(fetcher), today=today)
+    unsubscribe_url = None
+    base_url, secret = os.environ.get("RERA_TRACKER_BASE_URL", ""), os.environ.get("RERA_TRACKER_SECRET", "")
+    if base_url and secret:
+        unsubscribe_url = web.make_unsubscribe_url(base_url, secret)
+    tracker = Tracker(store, HaryanaSource(fetcher), today=today, unsubscribe_url=unsubscribe_url)
     try:
         if args.command == "sync":
             for authority in sorted(AUTHORITIES) if args.authority == "all" else [args.authority]:
@@ -114,14 +177,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.command == "report":
             print(tracker.status(_resolve(store, args.project), args.lang, args.refresh))
         elif args.command == "run":
-            keys = store.tracked_keys()
-            for authority in sorted({key.split(":", 1)[0] for key in keys}):
-                counts = tracker.sync(authority)
-                print("%s: %d projects (%d new)" % (authority, counts["total"], counts["new"]))
-            for key in keys:
-                _print_check(tracker.check(key))
-            counts = tracker.send(args.outbox)
-            print("%d sent, %d failed" % (counts["sent"], counts["failed"]))
+            return _daily_run(store, tracker, args.outbox)
     except (FetchError, ParseError, KeyError, ValueError) as error:
         print("error: %s" % error, file=sys.stderr)
         return 1

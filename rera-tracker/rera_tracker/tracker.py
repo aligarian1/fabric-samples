@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Callable, Dict, List, Optional
 
+from .clock import today_ist
 from .detect import Event, diff_states
 from .fetch import FetchError
 from .haryana import AUTHORITIES, HaryanaSource, ParseError
@@ -56,20 +57,29 @@ def build_state(
     return state
 
 
+# Builds a personal "stop alerts" link: (subscriber id, language, project key or None) -> URL.
+UnsubscribeUrl = Callable[[int, str, Optional[str]], str]
+
+
 class Tracker:
     def __init__(
         self,
         store: Store,
-        source: HaryanaSource,
+        source: Optional[HaryanaSource],
         today: Optional[date] = None,
         now: Callable[[], str] = _now,
         overdue_grace_days: int = 30,
+        unsubscribe_url: Optional[UnsubscribeUrl] = None,
     ) -> None:
         self.store = store
         self.source = source
-        self.today = today or date.today()
+        self.today = today or today_ist()
         self.now = now
         self.overdue_grace_days = overdue_grace_days
+        self.unsubscribe_url = unsubscribe_url
+
+    def _unsub(self, subscriber_id: int, lang: str, key: Optional[str]) -> Optional[str]:
+        return self.unsubscribe_url(subscriber_id, lang, key) if self.unsubscribe_url else None
 
     # -- list ----------------------------------------------------------------
     def sync(self, authority: str) -> Dict[str, int]:
@@ -130,7 +140,8 @@ class Tracker:
             if event.silent:
                 continue
             for subscriber in self.store.subscribers_for(key):
-                subject, body = render(event, state, self.today, subscriber["lang"])
+                unsub = self._unsub(subscriber["id"], subscriber["lang"], key)
+                subject, body = render(event, state, self.today, subscriber["lang"], unsubscribe_url=unsub)
                 queued += int(self.store.queue_message(subscriber["id"], event_id, subject, body, stamp))
         return {"key": key, "events": fresh, "queued": queued, "problems": problems, "state": state}
 
@@ -149,7 +160,8 @@ class Tracker:
         baseline = self.store.find_event(key, "baseline")
         if baseline is not None and project["state"]:
             event = Event("baseline", "baseline")
-            subject, body = render(event, project["state"], self.today, lang)
+            unsub = self._unsub(subscriber_id, lang, key)
+            subject, body = render(event, project["state"], self.today, lang, unsubscribe_url=unsub)
             self.store.queue_message(subscriber_id, baseline, subject, body, stamp)
         return subscriber_id
 
@@ -166,9 +178,14 @@ class Tracker:
     def send(self, outbox_dir: str = "outbox", out: Optional[Callable[[str], None]] = None) -> Dict[str, int]:
         sent = failed = 0
         for message in self.store.pending_messages():
+            headers = None
+            if message["channel"] == "email" and self.unsubscribe_url:
+                # Mail apps show an "Unsubscribe" button from these two headers (RFC 8058).
+                link = self.unsubscribe_url(message["subscriber_id"], message["lang"], None)
+                headers = {"List-Unsubscribe": "<%s>" % link, "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"}
             try:
                 deliver(message["channel"], message["address"], message["subject"], message["body"],
-                        message_id=message["id"], outbox_dir=outbox_dir, out=out)
+                        message_id=message["id"], outbox_dir=outbox_dir, out=out, headers=headers)
             except DeliveryError as error:
                 failed += 1
                 self.store.mark_sent(message["id"], None, str(error))
